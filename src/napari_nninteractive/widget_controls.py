@@ -254,6 +254,48 @@ class LayerControls(BaseGUI):
 
         self.session_cfg = self.source_cfg.copy()
 
+        # 0. Negative Scale
+        # A negative scale (orientation flip encoded in the file's affine) mirrors an
+        # Image/Labels layer's texture fine, but a Points layer's on-screen marker size is
+        # size * scale — negative scale makes that negative, and vispy silently refuses to
+        # draw a non-positive-size marker. Fix applies to the image layer itself (not just
+        # session_cfg) so every prompt layer's transform stays identical to the image
+        # layer's — required for world_to_data() to agree on data-space coordinates.
+        if np.any(np.asarray(self.session_cfg["scale"]) < 0):
+            show_warning(
+                "Your data has a negative scale (an orientation flip in the file's "
+                "affine). This is normalized to a positive magnitude so that point/bbox "
+                "prompts remain visible; it does not affect the interaction data."
+            )
+            old_scale = np.asarray(self.session_cfg["scale"], dtype=float)
+            old_translate = np.asarray(self.session_cfg["translate"], dtype=float)
+            shape = np.asarray(self.session_cfg["shape"], dtype=float)
+            negative = old_scale < 0
+            # Flipping a negative scale's sign to positive without also shifting
+            # translate moves the layer's world-space bounding box (world_coord =
+            # translate + index*scale — negating scale flips which end of the data
+            # range translate anchors). Shift translate by (shape-1)*old_scale on the
+            # flipped dims so the corrected (positive-scale) layer occupies the exact
+            # same world-space box the negative-scale one did — otherwise reset_view()
+            # re-centers the camera on the image's new, shifted position instead of
+            # where it actually was.
+            new_translate = old_translate.copy()
+            new_translate[negative] = old_translate[negative] + (shape[negative] - 1) * old_scale[negative]
+            self.session_cfg["scale"] = np.abs(old_scale)
+            self.session_cfg["translate"] = new_translate
+            # napari's dims slider recomputes its range from the layer's new
+            # scale/translate as each is assigned below, and clamps/resets
+            # current_step along the way (observed: jumps to (0,0,0) right after the
+            # scale assignment, then to the far corner after translate) — restore
+            # whatever slice the viewer was actually on before this correction touched
+            # either property.
+            _step_before_scale_fix = tuple(self._viewer.dims.current_step)
+            image_layer.scale = self.session_cfg["scale"]
+            image_layer.translate = self.session_cfg["translate"]
+            if len(_step_before_scale_fix) == len(self._viewer.dims.current_step):
+                self._viewer.dims.current_step = _step_before_scale_fix
+            self._viewer.reset_view()
+
         # 1. Non - Othogonal Affine
         if not (
             is_orthogonal(
@@ -333,6 +375,13 @@ class LayerControls(BaseGUI):
         if self.label_layer_name in self._viewer.layers:
             self._viewer.layers.remove(self.label_layer_name)
         self.add_label_layer(self._data_result, self.label_layer_name)
+
+        # Re-fit the camera to the new image — the non-orthogonal-transform branches above
+        # already call reset_view() for their own edge cases, but nothing did so
+        # unconditionally, so the previous image's pan/zoom carried over verbatim whenever
+        # the new image's world-space extent differed from the last one's. Same fix as
+        # napari-clopa's on_load_image() (widget_controls.py, commit 9c3f26b).
+        self._viewer.reset_view()
 
         # Lock the Session
         self._lock_session()
@@ -421,11 +470,19 @@ class LayerControls(BaseGUI):
     def on_run(self):
         if self.session is not None:
             self.session._predict()
+            self._snapshot_committed_interactions()
             self._viewer.layers[self.label_layer_name].refresh()
+        self.interaction_log.stop_window()
+        self._gate_idle()
 
     def on_interaction(self, event: Any):
+        # add_button.isEnabled() mirrors whatever the timing gate currently allows (and
+        # is untouched — always enabled while locked — when no preset/gate is active), so
+        # this also blocks a stray click from registering between a Reset and the next
+        # Resume, without needing to touch add_ckbx's own checked-state to do it.
         if (
             self.add_ckbx.isChecked()
+            and self.add_button.isEnabled()
             and event.action == ActionType.ADDED
             and not self._viewer.layers[event.source.name].is_free()
         ):

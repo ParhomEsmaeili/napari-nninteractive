@@ -1,5 +1,7 @@
+from pathlib import Path
 from typing import Optional
 
+from interaction_log import NullInteractionLog
 from napari.layers import Image, Labels
 from napari.viewer import Viewer
 from napari_toolkit.containers import setup_vcollapsiblegroupbox, setup_vgroupbox, setup_vscrollarea
@@ -12,6 +14,7 @@ from napari_toolkit.widgets import (
     setup_label,
     setup_layerselect,
     setup_lineedit,
+    setup_pushbutton,
     setup_spinbox,
     setup_vswitch,
 )
@@ -26,6 +29,21 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# Each custom layer-controls widget (point_controls.py etc.) forces its layer into an
+# interactive "add"-style mode the instant it becomes the active layer — a napari
+# layer-level property, entirely independent of any Qt button here. Disabling the
+# buttons alone doesn't stop a click from visually registering on the layer; the gate
+# has to touch this too.
+_ADD_MODE_BY_INTERACTION_INDEX = {0: 'add', 1: 'add_rectangle', 2: 'paint', 3: 'add_polygon_lasso'}
+_NEUTRAL_MODE = 'pan_zoom'
+
+# Dev convenience — a checkpoint copy gitignored into the repo itself (checkpoints/,
+# see .gitignore) so Model Selection has a working default instead of an empty field on
+# every fresh launch. Repo-relative, not an absolute machine path, so it degrades to no
+# default (falls back to the HF-download combobox path) on a clone without it, rather
+# than pointing at a path that doesn't exist there.
+_BUNDLED_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "nnInteractive_v1.0"
 
 
 class BaseGUI(QWidget):
@@ -45,12 +63,20 @@ class BaseGUI(QWidget):
         self._viewer = viewer
         self.session_cfg = None
 
+        # Default — no preset selected yet. Set here (not in the nnInteractiveWidget
+        # subclass) because _gate_idle() needs it to exist the moment _unlock_session()
+        # first runs, below, before the subclass's own __init__ continues.
+        self.interaction_log = NullInteractionLog()
+
         _main_layout = QVBoxLayout()
         self.setLayout(_main_layout)
 
         _scroll_widget, _scroll_layout = setup_vscrollarea(_main_layout)
 
         _scroll_layout.addWidget(self._init_model_selection())  # Model Selection
+        _scroll_layout.addWidget(self._init_config_selection())  # Config Selection
+        _scroll_layout.addWidget(self._init_preset_selection())  # Preset Selection
+        _scroll_layout.addWidget(self._init_case_selection())  # Case Selection
         _scroll_layout.addWidget(self._init_image_selection())  # Image Selection
         _scroll_layout.addWidget(self._init_control_buttons())  # Init and Reset Button
         _scroll_layout.addWidget(self._init_init_buttons())  # Init and Reset Button
@@ -74,6 +100,7 @@ class BaseGUI(QWidget):
         """Unlocks the session, enabling model and image selection, and initializing controls."""
         self.init_button.setEnabled(True)
 
+        self.resume_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.instance_aggregation_ckbx.setEnabled(False)
         self.prompt_button.setEnabled(False)
@@ -82,6 +109,7 @@ class BaseGUI(QWidget):
         self.run_ckbx.setEnabled(False)
         self.export_button.setEnabled(False)
         self.reset_interaction_button.setEnabled(False)
+        self.reset_pending_button.setEnabled(False)
         self.propagate_ckbx.setEnabled(False)
         self.label_for_init.setEnabled(False)
         self.class_for_init.setEnabled(False)
@@ -90,6 +118,17 @@ class BaseGUI(QWidget):
         self.load_mask_btn.setEnabled(False)
         self.add_button.setEnabled(False)
         self.add_ckbx.setEnabled(False)
+
+        # No active session at all — definitely no open timing window either.
+        self._gate_idle()
+        # _gate_idle() above assumes an in-progress case exists that needs Complete/Abandon
+        # before switching — true once a case is actually loaded, but not at true bootstrap
+        # (nothing loaded yet, or a prior session just got invalidated by re-browsing
+        # config). Override back to the correct bootstrap values: nothing to complete/
+        # abandon, but case selection must stay reachable to load the first case at all.
+        self._set_case_controls_enabled(True)
+        self.complete_button.setEnabled(False)
+        self.abandon_button.setEnabled(False)
 
     def _lock_session(self):
         """Locks the session, disabling model and image selection, and enabling control buttons."""
@@ -103,6 +142,7 @@ class BaseGUI(QWidget):
         self.run_ckbx.setEnabled(True)
         self.export_button.setEnabled(True)
         self.reset_interaction_button.setEnabled(True)
+        self.reset_pending_button.setEnabled(True)
         self.propagate_ckbx.setEnabled(True)
         self.label_for_init.setEnabled(True)
         self.class_for_init.setEnabled(True)
@@ -111,6 +151,83 @@ class BaseGUI(QWidget):
         self.load_mask_btn.setEnabled(True)
         self.add_button.setEnabled(True)
         self.add_ckbx.setEnabled(True)
+
+        # A freshly-locked session (new image/case just loaded) hasn't started a timing
+        # window yet, and hasn't declared an outcome for it either — reset to idle.
+        self._gate_idle()
+
+    # Timing gate — three states, strict cycle: idle -> window_open -> (repeat, or)
+    # case_done -> idle (for the next object/case). Each state enables exactly the
+    # controls valid to press from it; everything else is unreachable by construction.
+
+    def _gate_idle(self):
+        """Fresh — no window open, no outcome declared yet for the current object/case.
+        Can Resume (start a window) or declare Complete/Abandon directly (e.g. skipping a
+        case with zero interactions still needs an explicit outcome). Can't move on yet —
+        Next Object/case switching require an outcome first.
+
+        No-op (beyond disabling the timing controls themselves) when no preset is
+        selected — run_button/prompt-tools/reset_button/case_selection stay exactly as
+        _lock_session()/_unlock_session() already set them, today's exact behavior."""
+        if isinstance(self.interaction_log, NullInteractionLog):
+            self.resume_button.setEnabled(False)
+            self.complete_button.setEnabled(False)
+            self.abandon_button.setEnabled(False)
+            return
+        self.resume_button.setEnabled(True)
+        self.run_button.setEnabled(False)
+        self.interaction_button.setEnabled(False)
+        self.prompt_button.setEnabled(False)
+        self.add_button.setEnabled(False)
+        self.add_ckbx.setEnabled(False)
+        self.complete_button.setEnabled(True)
+        self.abandon_button.setEnabled(True)
+        self.reset_button.setEnabled(False)
+        self._set_case_controls_enabled(False)
+        self._set_active_prompt_layer_mode(_NEUTRAL_MODE)
+
+    def _gate_window_open(self):
+        """Timing window open (Resume clicked, not yet closed via Run). Only Run and the
+        prompt tools are usable — can't leave a window dangling open."""
+        self.resume_button.setEnabled(False)
+        self.run_button.setEnabled(True)
+        self.interaction_button.setEnabled(True)
+        self.prompt_button.setEnabled(True)
+        self.add_button.setEnabled(True)
+        self.add_ckbx.setEnabled(True)
+        self.complete_button.setEnabled(False)
+        self.abandon_button.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self._set_case_controls_enabled(False)
+        self._set_active_prompt_layer_mode(
+            _ADD_MODE_BY_INTERACTION_INDEX.get(self.interaction_button.index)
+        )
+
+    def _gate_case_done(self):
+        """Outcome just declared (Complete/Abandon pressed). Only Next Object/case
+        switching are usable — forces an explicit move-on rather than silently
+        continuing to place prompts or resuming again on a case just marked done."""
+        self.resume_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.interaction_button.setEnabled(False)
+        self.prompt_button.setEnabled(False)
+        self.add_button.setEnabled(False)
+        self.add_ckbx.setEnabled(False)
+        self.complete_button.setEnabled(False)
+        self.abandon_button.setEnabled(False)
+        self.reset_button.setEnabled(True)
+        self._set_case_controls_enabled(True)
+        self._set_active_prompt_layer_mode(_NEUTRAL_MODE)
+
+    def _set_active_prompt_layer_mode(self, mode):
+        """Sets the currently-selected prompt layer's own napari mode — separate from
+        (and untouched by) any of the Qt buttons above. mode=None is a no-op, so an
+        unrecognized interaction index safely does nothing rather than raising."""
+        if mode is None:
+            return
+        layer_name = self.layer_dict.get(self.interaction_button.index)
+        if layer_name is not None and layer_name in self._viewer.layers:
+            self._viewer.layers[layer_name].mode = mode
 
     def _clear_layers(self):
         """Abstract function to clear all needed layers"""
@@ -128,7 +245,10 @@ class BaseGUI(QWidget):
         _boxlayout = QHBoxLayout()
         _layout.addLayout(_boxlayout)
         self.model_selection_local = setup_lineedit(
-            _boxlayout, placeholder="Use Local Checkpoint...", function=self.on_model_selected
+            _boxlayout,
+            text=str(_BUNDLED_CHECKPOINT_DIR) if _BUNDLED_CHECKPOINT_DIR.is_dir() else None,
+            placeholder="Use Local Checkpoint...",
+            function=self.on_model_selected,
         )
 
         def _reset_local_ckpt_lineedit():
@@ -139,6 +259,98 @@ class BaseGUI(QWidget):
             _boxlayout, "", "delete_shape", self._viewer.theme, function=_reset_local_ckpt_lineedit
         )
         btn.setFixedWidth(30)
+
+        _group_box.setLayout(_layout)
+        return _group_box
+
+    def _init_config_selection(self) -> QGroupBox:
+        """Config JSON browse — reads export_napari_config.json's full_image_cache for a
+        case list (consumed by _init_case_selection, below). Ignores checkpoint_path/
+        episode entirely (no adaptation concept in nnInteractive)."""
+        _group_box, _layout = setup_vgroupbox(text="Config (timing/experiment):")
+
+        _boxlayout = QHBoxLayout()
+        _layout.addLayout(_boxlayout)
+        self.config_path_display = setup_lineedit(_boxlayout, placeholder="No config loaded...")
+        self.config_path_display.setReadOnly(True)
+        setup_iconbutton(_boxlayout, "", "path", self._viewer.theme, function=self.on_browse_config)
+
+        _group_box.setLayout(_layout)
+        return _group_box
+
+    def _set_case_controls_enabled(self, enabled: bool):
+        """case_selection/open_case_button/prev_case_button/next_case_button are always
+        toggled together — one place to keep them in sync rather than four call sites."""
+        self.case_selection.setEnabled(enabled)
+        self.open_case_button.setEnabled(enabled)
+        self.prev_case_button.setEnabled(enabled)
+        self.next_case_button.setEnabled(enabled)
+
+    def _init_preset_selection(self) -> QGroupBox:
+        """Initializes the preset selection group box: presets.json picker + preset
+        dropdown. Disabled until a config is loaded — resolve_session() needs config_dir/
+        config_basename, which only exist once on_browse_config() has run."""
+        _group_box, _layout = setup_vgroupbox(text="Preset (timing/logging):")
+
+        _path_layout = QHBoxLayout()
+        self.presets_path_lineedit = setup_lineedit(
+            _path_layout, placeholder="No presets.json loaded", readonly=True, stretch=3
+        )
+        self.browse_presets_button = setup_pushbutton(
+            _path_layout, "Browse", function=self.on_browse_presets, stretch=1
+        )
+        _layout.addLayout(_path_layout)
+
+        _preset_row = QHBoxLayout()
+        self.preset_selection = setup_combobox(
+            _preset_row, options=[], placeholder="No preset selected", function=self.on_preset_selected, stretch=3
+        )
+        self.preset_description_button = setup_iconbutton(
+            _preset_row,
+            "",
+            "info",
+            self._viewer.theme,
+            self.on_show_preset_description,
+            tooltips="Show this preset's description",
+            stretch=1,
+        )
+        _layout.addLayout(_preset_row)
+
+        self.change_preset_button = setup_pushbutton(
+            _layout, "Change Preset", function=self.on_change_preset,
+        )
+
+        self.browse_presets_button.setEnabled(False)
+        self.preset_selection.setEnabled(False)
+        self.preset_description_button.setEnabled(False)
+        self.change_preset_button.setEnabled(False)
+
+        _group_box.setLayout(_layout)
+        return _group_box
+
+    def _init_case_selection(self) -> QGroupBox:
+        """Case dropdown + Open Case/Prev/Next — separate group from config-browse
+        (above) so Preset can sit between them, matching the required click order
+        (Config -> Preset -> Case, not Config+Case together above Preset)."""
+        _group_box, _layout = setup_vgroupbox(text="Case Selection:")
+
+        self.case_selection = setup_combobox(_layout, options=[], function=None)
+
+        _case_nav_row = QHBoxLayout()
+        self.prev_case_button = setup_iconbutton(
+            _case_nav_row, "Prev", "step_left", self._viewer.theme, self.on_prev_case,
+            tooltips="Open the previous case in the list", stretch=1,
+        )
+        self.open_case_button = setup_iconbutton(
+            _case_nav_row, "Open Case", "new_points", self._viewer.theme, function=self.on_open_case, stretch=2
+        )
+        self.next_case_button = setup_iconbutton(
+            _case_nav_row, "Next", "step_right", self._viewer.theme, self.on_next_case,
+            tooltips="Open the next case in the list", stretch=1,
+        )
+        _layout.addLayout(_case_nav_row)
+
+        self.task_label = setup_label(_layout, "Target: —")
 
         _group_box.setLayout(_layout)
         return _group_box
@@ -173,9 +385,18 @@ class BaseGUI(QWidget):
             "delete",
             self._viewer.theme,
             self.on_reset_interactions,
-            tooltips="Keep Model and Image Pair, just reset the interactions for the current object  - press R",
+            tooltips="Clear the current object entirely — interactions AND its predicted mask — and start it fresh on the next prediction. Model and Image Pair stay loaded. Use Reset Pending instead to just undo un-run interactions - press R",
             shortcut="R",
         )
+        self.reset_pending_button = setup_iconbutton(
+            _layout,
+            "Reset Pending",
+            "erase",
+            self._viewer.theme,
+            self.on_reset_pending_interactions,
+            tooltips="Clear interactions placed since the last prediction — keeps the object's prediction history",
+        )
+
         self.reset_button = setup_iconbutton(
             _layout,
             "Next Object",
@@ -192,6 +413,27 @@ class BaseGUI(QWidget):
             False,
             tooltips="If checked: Add all objects to a single layer. In the case of overlap newer objects overwrite older objects.\n"
             "Otherwise: Create a separate layer for each object. ",
+        )
+
+        # Timing/logging controls — explicit actions, not a passive toggle, so an outcome
+        # can never be silently left stale from a previous case. Pressing either sets
+        # InteractionLog's outcome and locks everything except Next Object/Case selector,
+        # forcing an explicit move-on (see _gate_case_done()). Placement not final.
+        self.complete_button = setup_iconbutton(
+            _layout,
+            "Complete",
+            "check",
+            self._viewer.theme,
+            self.on_complete,
+            tooltips="Mark this case/object as completed, then use Next Object or Open Case to move on",
+        )
+        self.abandon_button = setup_iconbutton(
+            _layout,
+            "Abandon",
+            "warning",
+            self._viewer.theme,
+            self.on_abandon,
+            tooltips="Mark this case/object as abandoned, then use Next Object or Open Case to move on",
         )
 
         _group_box.setLayout(_layout)
@@ -289,6 +531,16 @@ class BaseGUI(QWidget):
         """Initializes the run button and auto-run checkbox"""
         _group_box, _layout = setup_vcollapsiblegroupbox(text="Manual Control:", collapsed=True)
 
+        # Timing/logging control — placement not final, just needs to exist for now.
+        self.resume_button = setup_iconbutton(
+            _layout,
+            "Resume",
+            "right_arrow",
+            self._viewer.theme,
+            self.on_resume,
+            tooltips="Start a new timed window",
+        )
+
         h_layout = QHBoxLayout()
         _layout.addLayout(h_layout)
 
@@ -312,7 +564,7 @@ class BaseGUI(QWidget):
         self.run_ckbx = setup_checkbox(
             _layout,
             "Auto Run Prediction",
-            True,
+            False,
             tooltips="Run automatically after each interaction",
         )
 

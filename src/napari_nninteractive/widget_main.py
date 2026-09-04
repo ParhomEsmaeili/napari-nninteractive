@@ -1,4 +1,6 @@
+import json
 import os
+import subprocess
 import warnings
 from pathlib import Path
 from typing import Any, Optional
@@ -10,9 +12,39 @@ from batchgenerators.utilities.file_and_folder_operations import join, load_json
 from napari.utils.notifications import show_warning
 from napari.viewer import Viewer
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-from qtpy.QtWidgets import QWidget
+from qtpy.QtWidgets import QFileDialog, QMessageBox, QWidget
 
 from napari_nninteractive.widget_controls import LayerControls
+import presets
+from interaction_log import InteractionLog, NullInteractionLog
+from presets import load_presets, resolve_session
+
+# presets.json always lives alongside the front-end-timing package itself (unlike
+# configs, which vary per run) — derived from the installed package's own location so
+# the browse dialog starts somewhere useful instead of the launch cwd.
+PRESETS_DEFAULT_DIR = os.path.dirname(presets.__file__)
+
+# Preset-application/control-locking. locked_controls is fully derived
+# (presets.py's _derive_locked_controls()) from algorithm_config + prompt_type — see
+# timing-package-plan.md Step 7c. Every entry maps to exactly one GUI control. Shared by
+# on_preset_selected() (locks) and on_change_preset() (unlocks the same entries).
+_PROMPT_TYPE_TO_BUTTON_INDEX = {'points': 0, 'bbox': 1, 'scribble': 2, 'lasso': 3}
+
+
+def _get_code_version() -> str | None:
+    """This plugin's own git commit hash — front-end-timing can't compute this itself
+    (shared across plugins, each in a separate repo), so each widget supplies its own.
+    See timing-package-plan.md Step 7e. None if git/the repo isn't available (not fatal —
+    records just won't have this field populated)."""
+    try:
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=repo_root, capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
 
 
 class nnInteractiveWidget_(LayerControls):
@@ -32,6 +64,135 @@ class nnInteractiveWidget(LayerControls):
         super().__init__(viewer, parent)
         self.session = None
         self._viewer.dims.events.order.connect(self.on_axis_change)
+        # self.interaction_log defaults to NullInteractionLog — see BaseGUI.__init__.
+        # Replaced with a real InteractionLog once a preset is selected (on_preset_selected()).
+
+    # Timing/logging controls
+    def on_resume(self):
+        self.interaction_log.resume()
+        self._gate_window_open()
+
+    def on_complete(self):
+        self.interaction_log.set_outcome("completed")
+        self._gate_case_done()
+
+    def on_abandon(self):
+        self.interaction_log.set_outcome("abandoned")
+        self._gate_case_done()
+
+    def on_browse_presets(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select presets.json", PRESETS_DEFAULT_DIR, "JSON files (*.json)"
+        )
+        if path == "":
+            return
+        self.presets_path = path
+        self.presets_path_lineedit.setText(path)
+        available_presets = load_presets(path)
+        self.preset_selection.clear()
+        self.preset_selection.addItems(available_presets.keys())
+        self.preset_selection.setEnabled(True)
+
+    def on_preset_selected(self):
+        preset_id = self.preset_selection.currentText()
+        if preset_id == "":
+            return
+
+        # resolve_session()'s config_dir/config_basename — derived from the loaded
+        # config's path, matching <config_dir>/timing/<config_basename>/<fe_experiment>/...
+        config_run_dir = os.path.dirname(self.config_path)
+        config_dir = os.path.dirname(config_run_dir)
+        config_basename = os.path.basename(config_run_dir)
+        config_dataset_name = self.dataset_level_schema['data_schema']['dataset_name']
+
+        try:
+            session_context = resolve_session(
+                preset_id,
+                self.presets_path,
+                config_dir,
+                config_basename,
+                config_dataset_name=config_dataset_name,
+                # Preset selection happens before Initialize in the normal flow (config ->
+                # preset -> Initialize -> Open Case), so self.checkpoint_path (set by
+                # widget_controls.py's on_init) may not exist yet. None until it does —
+                # matches presets.py's own "None for plugins with nothing to log yet" case.
+                checkpoint_path=getattr(self, "checkpoint_path", None),
+            )
+        except ValueError as e:
+            show_warning(str(e))
+            self.preset_selection.setCurrentIndex(-1)
+            return
+
+        session_context.tags['code_version'] = _get_code_version()
+        self.interaction_log = InteractionLog(
+            save_path=session_context.save_path, tags=session_context.tags
+        )
+
+        for control in session_context.locked_controls:
+            if control == 'autozoom':
+                locked_value = session_context.tags['algorithm_config'].get('autozoom')
+                self.propagate_ckbx.setChecked(locked_value == 'on')
+                self.propagate_ckbx.setEnabled(False)
+            elif control in _PROMPT_TYPE_TO_BUTTON_INDEX:
+                self.interaction_button.buttons[_PROMPT_TYPE_TO_BUTTON_INDEX[control]].setEnabled(False)
+
+        # Default to whichever interaction tool the preset actually permits, in case the
+        # previously-selected one just got locked out above.
+        allowed_index = _PROMPT_TYPE_TO_BUTTON_INDEX.get(session_context.tags['prompt_type'])
+        if allowed_index is not None:
+            self.interaction_button._uncheck()
+            self.interaction_button._check(allowed_index)
+
+        # Locked while active — on_change_preset() is the escape hatch, not direct
+        # re-selection, so a switch always goes through its discard_object() safety step.
+        self.preset_selection.setEnabled(False)
+        self.browse_presets_button.setEnabled(False)
+        self.preset_description_button.setEnabled(True)
+        self.change_preset_button.setEnabled(True)
+
+        # Same bootstrap gap as _unlock_session(): _gate_idle() assumes a case is already
+        # in progress (needs an outcome before switching), which isn't true yet here —
+        # no case has been opened this session. Override back to bootstrap values.
+        self._gate_idle()
+        self._set_case_controls_enabled(True)
+        self.complete_button.setEnabled(False)
+        self.abandon_button.setEnabled(False)
+
+    def on_show_preset_description(self):
+        QMessageBox.information(
+            self, "Preset Description", self.interaction_log.tags.get('description') or "(no description)"
+        )
+
+    def on_change_preset(self):
+        # Safe by construction: discard_object() wipes only whatever's in-flight and not
+        # yet finalize_case()'d for the *current* object — everything already finalized to
+        # disk under the old preset's save_path is untouched. Same data-safety guarantee
+        # Reset Object already relies on.
+        self.interaction_log.discard_object()
+
+        # Reverse on_preset_selected()'s locking loop for whatever this preset locked.
+        for control in self.interaction_log.tags.get('locked_controls', []):
+            if control == 'autozoom':
+                self.propagate_ckbx.setEnabled(True)
+            elif control in _PROMPT_TYPE_TO_BUTTON_INDEX:
+                self.interaction_button.buttons[_PROMPT_TYPE_TO_BUTTON_INDEX[control]].setEnabled(True)
+
+        self.interaction_log = NullInteractionLog()
+        # Avoids on_open_case() finalizing a stale outgoing case against a log that no
+        # longer corresponds to it (a fresh Null, or a different preset picked next).
+        self.current_case_id = None
+
+        self.preset_selection.setCurrentIndex(-1)
+        self.preset_selection.setEnabled(True)
+        self.browse_presets_button.setEnabled(True)
+        self.preset_description_button.setEnabled(False)
+        self.change_preset_button.setEnabled(False)
+
+        # Back to the exact bootstrap state — _gate_idle()'s Null-guard branch only
+        # touches resume/complete/abandon, so case controls need the same override
+        # _unlock_session()/on_preset_selected() already use.
+        self._gate_idle()
+        self._set_case_controls_enabled(True)
 
     # Event Handlers
     def on_init(self, *args, **kwargs):
@@ -42,6 +203,13 @@ class nnInteractiveWidget(LayerControls):
         pre-trained model folder and initializing properties based on the viewer layer.
         """
         super().on_init(*args, **kwargs)
+        # checkpoint_path is only resolved by super().on_init() just above (model
+        # selection happens at Initialize time, after preset selection in the normal
+        # flow) — on_preset_selected() logged it as None since it didn't exist yet.
+        # Patch it into the already-created log's tags now that it's known, before any
+        # finalize_case() call happens.
+        if not isinstance(self.interaction_log, NullInteractionLog):
+            self.interaction_log.tags['checkpoint_path'] = self.checkpoint_path
         if self.session is None:
             # Get inference class from Checkpoint
             if Path(self.checkpoint_path).joinpath("inference_session_class.json").is_file():
@@ -94,6 +262,7 @@ class nnInteractiveWidget(LayerControls):
             _data = _data[np.newaxis, ...]
 
         self.session.set_image(_data, {"spacing": self.session_cfg["spacing"]})
+        self._snapshot_committed_interactions()
 
         self.session.set_target_buffer(self._data_result)
 
@@ -119,6 +288,7 @@ class nnInteractiveWidget(LayerControls):
         super().on_image_selected()
         if self.session is not None:
             self.session.reset_interactions()
+            self._snapshot_committed_interactions()
 
     def on_reset_interactions(self):
         """Reset only the current interaction"""
@@ -126,6 +296,7 @@ class nnInteractiveWidget(LayerControls):
         super().on_reset_interactions()
         if self.session is not None:
             self.session.reset_interactions()
+            self._snapshot_committed_interactions()
 
         self._viewer.layers[self.label_layer_name].refresh()
 
@@ -133,6 +304,32 @@ class nnInteractiveWidget(LayerControls):
         self.on_interaction_selected()
         # self.prompt_button._uncheck()
         self.prompt_button._on_button_pressed(0)
+        # Hard reset for this object — deliberately ungated (unlike everything else), so
+        # a mistaken Complete/Abandon can always be walked back. Closes any open window too.
+        self.interaction_log.discard_object()
+        self._gate_idle()
+
+    def on_reset_pending_interactions(self):
+        # Only clears interactions placed since the last prediction — unlike
+        # on_reset_interactions(), never touches self.session's committed history (no
+        # forced re-init on next flush). Restores from the snapshot taken at the last
+        # commit point rather than forcing has_positive_bbox False — see
+        # [[concept/nninteractive-reset-pending]] for the desync edge case that guards
+        # against (a committed positive bbox predicted at zoom 1 without refinement).
+        _ind = self.interaction_button.index
+        self._clear_layers()
+        if self.session is not None and getattr(self, "_committed_interactions", None) is not None:
+            self.session.interactions = self._committed_interactions.clone()
+            self.session.has_positive_bbox = self._committed_has_positive_bbox
+            self.session.new_interaction_centers = []
+            self.session.new_interaction_zoom_out_factors = []
+        self.interaction_button._check(_ind)
+        self.on_interaction_selected()
+        # Discards the whole current window (not just the pending prompts) — see
+        # discard_pending()'s docstring — so this also needs a fresh Resume, same as
+        # on_reset_interactions().
+        self.interaction_log.discard_pending()
+        self._gate_idle()
 
     def on_next(self):
         """Reset the Interactions of current session"""
@@ -140,6 +337,7 @@ class nnInteractiveWidget(LayerControls):
         super().on_next()
         if self.session is not None:
             self.session.reset_interactions()
+            self._snapshot_committed_interactions()
 
         # if (
         #     self.use_init_ckbx.isChecked()
@@ -152,6 +350,35 @@ class nnInteractiveWidget(LayerControls):
         self.interaction_button._check(_ind)
         self.on_interaction_selected()
         self.prompt_button._check(0)
+
+        # Outcome was already set by on_complete()/on_abandon() — the gate (_gate_case_done())
+        # guarantees Next Object is unreachable until one of those ran, so it's always set here.
+        # object_index suffix disambiguates multiple objects within the same case — super()
+        # already incremented it above, so this is "the object number just committed".
+        self.interaction_log.finalize_case(f"{self.case_selection.currentText()}_obj{self.object_index}")
+        self._gate_idle()
+
+    def _snapshot_committed_interactions(self):
+        """Reset Pending's commit-point snapshot — plugin-side only, no change to the
+        separate nnInteractive inference library (see [[concept/nninteractive-reset-pending]]).
+        Called after every point at which self.session's interaction tensor becomes the
+        new "committed" baseline: set_image (on_init), reset_interactions
+        (on_image_selected/on_reset_interactions/on_next), and _predict (on_run in
+        widget_controls.py, and the autorun branch of add_interaction() below, which
+        flushes via _predict() internally without ever calling on_run()).
+
+        set_image() offloads image preprocessing AND interaction-tensor initialization to
+        a background thread and returns immediately — self.session.interactions is still
+        None right after it returns. _finish_preprocessing_and_initialize_interactions()
+        is the same wait every add_X_interaction() call does internally before touching
+        the tensor; calling it here is a no-op once the tensor already exists (every
+        other call site), so this is cheap everywhere except right after set_image()."""
+        if self.session is None:
+            return
+        self.session._finish_preprocessing_and_initialize_interactions()
+        if self.session.interactions is not None:
+            self._committed_interactions = self.session.interactions.clone()
+            self._committed_has_positive_bbox = self.session.has_positive_bbox
 
     def on_propagate_ckbx(self, *args, **kwargs):
         if self.session is not None:
@@ -173,6 +400,112 @@ class nnInteractiveWidget(LayerControls):
             if self.scribble_layer_name in self._viewer.layers:
                 self._viewer.layers[self.scribble_layer_name].brush_size = self._scribble_brush_size
 
+    # Config / case loading — timing/experiment infrastructure, not part of upstream
+
+    def on_browse_config(self):
+        """Reads export_napari_config.json's full_image_cache for a case list. Ignores
+        checkpoint_path/default_episode_number entirely — no adaptation/episode concept
+        in nnInteractive. semantic_id_dict is read for display only, never passed to
+        set_image()."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select Config JSON", os.getcwd(), "JSON files (*.json)")
+        if path == "":
+            return
+        self.config_path = path
+        with open(path, 'r') as f:
+            config = json.load(f)
+        self.dataset_level_schema = config['dataset_level_schema']
+        self.full_image_cache = self.dataset_level_schema['full_image_cache']
+        self.semantic_id_dict = self.dataset_level_schema['segmentation_task_schema']['semantic_id_dict']
+        self.config_path_display.setText(path)
+        self.case_selection.clear()
+        self.case_selection.addItems(self.full_image_cache.keys())
+
+        # Presets need config_dir/config_basename (see resolve_session()), which only
+        # exist once config_path is set.
+        self.browse_presets_button.setEnabled(True)
+
+    def on_prev_case(self):
+        self._step_case(-1)
+
+    def on_next_case(self):
+        self._step_case(1)
+
+    def _step_case(self, delta: int):
+        _new_idx = self.case_selection.currentIndex() + delta
+        if not (0 <= _new_idx < self.case_selection.count()):
+            show_warning("No more cases in that direction.")
+            return
+        self.case_selection.setCurrentIndex(_new_idx)  # currentText() reflects this immediately
+        self.on_open_case()
+
+    def on_open_case(self):
+        """Convenience layer on top of the existing flow — opens the resolved image path(s)
+        into napari and pre-selects it in Image Selection. No hard-refuse gate, deliberately
+        unlike CLoPA: manually opening arbitrary images outside the case list must keep
+        working, nnInteractive has no concept to validate a case against anyway."""
+        # Finalize the outgoing case, if any — read from current_case_id (stashed below on
+        # the *previous* call), not case_selection.currentText(): the combobox already
+        # reflects the newly-picked case the user selected before clicking Open Case, not
+        # the one they're leaving. The gate (_gate_case_done()) guarantees an outcome was
+        # already declared before Open Case became reachable, so this is always set here.
+        _outgoing_case_id = getattr(self, "current_case_id", None)
+        if _outgoing_case_id is not None:
+            self.interaction_log.finalize_case(f"{_outgoing_case_id}_obj{self.object_index}")
+
+        case_id = self.case_selection.currentText()
+        if case_id == "":
+            return
+        self.current_case_id = case_id
+
+        case = self.full_image_cache[case_id]
+        images = case['images']
+        path = images.get('merged') or next(iter(images.values()))
+
+        # Remove the previously-opened case's image layer, if any — Open Case means
+        # switching to a case, not accumulating every case ever opened in the viewer.
+        # Same fix as napari-clopa's on_open_case() (widget_main.py:241-249).
+        old_layer_name = getattr(self, "current_case_layer_name", None)
+        if (
+            old_layer_name is not None
+            and old_layer_name in self._viewer.layers
+            and os.path.abspath(self._viewer.layers[old_layer_name].source.path or "") != os.path.abspath(path)
+        ):
+            self._viewer.layers.remove(old_layer_name)
+
+        # Reuse an already-open layer for this exact file instead of opening a duplicate.
+        existing = next(
+            (
+                layer for layer in self._viewer.layers
+                if os.path.abspath(layer.source.path or "") == os.path.abspath(path)
+            ),
+            None,
+        )
+        if existing is not None:
+            layer_name = existing.name
+        else:
+            # Explicit plugin, matching napari-clopa's own on_open_case() style
+            # (plugin='napari-clopa') rather than relying on auto-discovery. napari's own
+            # open() default is the literal string 'napari', which restricts to builtin
+            # readers only and silently skips napari-nifti for .nii.gz — nnInteractive has
+            # no reader of its own, so this must name napari-nifti explicitly.
+            layers = self._viewer.open(path, plugin='napari-nifti')
+            layer_name = layers[0].name
+
+        idx = self.image_selection.findText(layer_name)
+        if idx >= 0:
+            self.image_selection.setCurrentIndex(idx)
+        self.current_case_layer_name = layer_name
+        self.task_label.setText(
+            f"Target: {list(self.semantic_id_dict.keys())} | Channels: {case.get('task_channels', 'unknown')}"
+        )
+
+        # Auto-chain into Initialize — after Open Case there's only one sensible next
+        # step, same reasoning as CLoPA's on_open_case() auto-chaining into
+        # on_load_image(). Cheap on every case after the first: on_init() only
+        # reconstructs the model/session when self.session is still None, otherwise it
+        # just re-points the existing session at this case's image via set_image().
+        self.on_init()
+
     # Inference Behaviour
 
     def add_interaction(self):
@@ -191,6 +524,7 @@ class nnInteractiveWidget(LayerControls):
             if data is not None:
                 _prompt = self.prompt_button.index == 0
                 _auto_run = self.run_ckbx.isChecked()
+                self.interaction_log.record_prompt()
 
                 if _index == 0:
                     self._viewer.layers[self.point_layer_name].refresh(force=True)
@@ -206,6 +540,19 @@ class nnInteractiveWidget(LayerControls):
                 elif _index == 3:
                     self.session.add_lasso_interaction(data, _prompt, _auto_run)
 
+                if _auto_run:
+                    # Autorun flushes inside session.add_X_interaction() above, bypassing
+                    # on_run() entirely — so this is the only place that sees an autorun
+                    # flush complete and can commit the Reset Pending snapshot and clear
+                    # the just-consumed on-screen prompts.
+                    self._snapshot_committed_interactions()
+                    self._clear_layers()
+                    self.interaction_button._check(_index)
+                    self.on_interaction_selected()
+                    # Same reason: on_run()'s stop_window()/_gate_idle() never run for
+                    # an autorun flush, since it never goes through on_run() at all.
+                    self.interaction_log.stop_window()
+                    self._gate_idle()
                 self._viewer.layers[self.label_layer_name].refresh()
 
     def on_load_mask(self):
