@@ -9,6 +9,7 @@ import nnInteractive
 import numpy as np
 import torch
 from batchgenerators.utilities.file_and_folder_operations import join, load_json
+from napari.layers import Image
 from napari.utils.notifications import show_warning
 from napari.viewer import Viewer
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
@@ -89,6 +90,17 @@ class nnInteractiveWidget(LayerControls):
         self.presets_path = path
         self.presets_path_lineedit.setText(path)
         available_presets = load_presets(path)
+        # presets.json is shared across every model this package supports, on purpose
+        # (see presets.py's module docstring — the same condition compared across
+        # models by design), so it isn't pre-filtered by model — selecting a preset
+        # meant for a different plugin resolves fine (same dataset, wrong model) and
+        # silently writes into that other model's JSONL file instead. nnInteractive
+        # is always the one fixed model_registry key (no per-checkpoint versioning
+        # like CLoPA's), so this is a plain exact-match filter.
+        available_presets = {
+            preset_id: preset for preset_id, preset in available_presets.items()
+            if preset.get('model') == 'nninteractive'
+        }
         self.preset_selection.clear()
         self.preset_selection.addItems(available_presets.keys())
         self.preset_selection.setEnabled(True)
@@ -117,6 +129,7 @@ class nnInteractiveWidget(LayerControls):
                 # widget_controls.py's on_init) may not exist yet. None until it does —
                 # matches presets.py's own "None for plugins with nothing to log yet" case.
                 checkpoint_path=getattr(self, "checkpoint_path", None),
+                play_around=self.play_around_ckbx.isChecked(),
             )
         except ValueError as e:
             show_warning(str(e))
@@ -147,6 +160,7 @@ class nnInteractiveWidget(LayerControls):
         # re-selection, so a switch always goes through its discard_object() safety step.
         self.preset_selection.setEnabled(False)
         self.browse_presets_button.setEnabled(False)
+        self.play_around_ckbx.setEnabled(False)
         self.preset_description_button.setEnabled(True)
         self.change_preset_button.setEnabled(True)
 
@@ -164,11 +178,26 @@ class nnInteractiveWidget(LayerControls):
         )
 
     def on_change_preset(self):
-        # Safe by construction: discard_object() wipes only whatever's in-flight and not
-        # yet finalize_case()'d for the *current* object — everything already finalized to
-        # disk under the old preset's save_path is untouched. Same data-safety guarantee
-        # Reset Object already relies on.
-        self.interaction_log.discard_object()
+        # discard_object() wipes only genuinely in-flight, undeclared work — everything
+        # already finalized to disk under the old preset's save_path is untouched, same
+        # data-safety guarantee Reset Object already relies on. But Complete/Abandon may
+        # already have declared an outcome for the current object without it having been
+        # flushed yet (Next Object/Open Case are what normally flush it) — change_preset_button
+        # stays enabled through case_done, so this is reachable. Discarding that would
+        # silently drop the whole record instead of just losing in-flight edits, so finalize
+        # it here instead, same as leaving via Open Case would.
+        if self.interaction_log.has_outcome:
+            if self._object_index_logged:
+                self.object_index += 1
+            self.interaction_log.finalize_case(f"{self.current_case_id}_obj{self.object_index}")
+            self._object_index_logged = True
+        else:
+            self.interaction_log.discard_object()
+
+        # Same sweep as on_open_case() — a preset switch abandons whatever case was open
+        # just as much as switching cases does.
+        self._clear_layers()
+        self._clear_finished_object_layers()
 
         # Reverse on_preset_selected()'s locking loop for whatever this preset locked.
         for control in self.interaction_log.tags.get('locked_controls', []):
@@ -185,14 +214,18 @@ class nnInteractiveWidget(LayerControls):
         self.preset_selection.setCurrentIndex(-1)
         self.preset_selection.setEnabled(True)
         self.browse_presets_button.setEnabled(True)
+        self.play_around_ckbx.setChecked(False)
+        self.play_around_ckbx.setEnabled(True)
         self.preset_description_button.setEnabled(False)
         self.change_preset_button.setEnabled(False)
 
         # Back to the exact bootstrap state — _gate_idle()'s Null-guard branch only
         # touches resume/complete/abandon, so case controls need the same override
-        # _unlock_session()/on_preset_selected() already use.
+        # _unlock_session() uses: locked again until a preset is picked, same as bootstrap
+        # (Case Selection hard-gates on an active preset — see
+        # nninteractive-implementation-handoff.md).
         self._gate_idle()
-        self._set_case_controls_enabled(True)
+        self._set_case_controls_enabled(False)
 
     # Event Handlers
     def on_init(self, *args, **kwargs):
@@ -284,11 +317,17 @@ class nnInteractiveWidget(LayerControls):
         self.session = None
 
     def on_image_selected(self):
-        """Reset the current sessions interaction but keep the session itself"""
-        super().on_image_selected()
-        if self.session is not None:
-            self.session.reset_interactions()
-            self._snapshot_committed_interactions()
+        """Deliberately does nothing. This fires on every change of which layer the
+        Image Selection dropdown shows as current — not only genuine intent to switch
+        the working image, e.g. an unrelated Image layer someone dropped into the
+        viewer directly (this plugin never opens one itself for anything other than a
+        case's own image, via on_open_case()). The old body (super().on_image_selected()
+        -> _clear_layers() + _unlock_session(), plus session.reset_interactions() +
+        _snapshot_committed_interactions() here) used to fire on that alone, silently
+        wiping in-progress prompts/predictions and, once Case Selection hard-gates on an
+        active preset, wrongly re-locking it too. Open Case (which auto-chains into
+        on_init()) stays the one deliberate trigger for actually switching the working
+        image and resetting everything around it."""
 
     def on_reset_interactions(self):
         """Reset only the current interaction"""
@@ -356,6 +395,10 @@ class nnInteractiveWidget(LayerControls):
         # object_index suffix disambiguates multiple objects within the same case — super()
         # already incremented it above, so this is "the object number just committed".
         self.interaction_log.finalize_case(f"{self.case_selection.currentText()}_obj{self.object_index}")
+        # Marks this object_index value as spent — if the user leaves without another
+        # Next Object, on_open_case()/on_change_preset() must bump past it rather than
+        # reusing it for a different object (see _object_index_logged's own docstring).
+        self._object_index_logged = True
         self._gate_idle()
 
     def _snapshot_committed_interactions(self):
@@ -410,6 +453,40 @@ class nnInteractiveWidget(LayerControls):
         path, _ = QFileDialog.getOpenFileName(self, "Select Config JSON", os.getcwd(), "JSON files (*.json)")
         if path == "":
             return
+
+        # Dump the outgoing case, if any — same pattern as on_open_case()'s outgoing
+        # finalize. Safe unconditionally: browse_config_button is only enabled (see
+        # _gate_idle()/_gate_window_open()/_gate_case_done()) when there's no live,
+        # undeclared object in progress — case_done (outcome already set) or no case
+        # ever opened at all — so this can never write a None-outcome record.
+        _outgoing_case_id = getattr(self, "current_case_id", None)
+        if _outgoing_case_id is not None:
+            self.interaction_log.finalize_case(f"{_outgoing_case_id}_obj{self.object_index}")
+
+        # Full reset — browsing a new config invalidates everything tied to the old
+        # one: the preset (locked_controls/save_path are specific to the old config's
+        # directory), the case (may not exist in the new config's full_image_cache),
+        # and the timing log itself. Mirrors on_change_preset()'s reset, since this is
+        # a strictly bigger invalidation (a new config implies a new preset too).
+        # Reverse on_preset_selected()'s locking loop for whatever the old preset
+        # locked — has to read .tags before resetting to Null below (NullInteractionLog
+        # has no .tags at all), and only if a real preset was actually active.
+        if not isinstance(self.interaction_log, NullInteractionLog):
+            for control in self.interaction_log.tags.get('locked_controls', []):
+                if control == 'autozoom':
+                    self.propagate_ckbx.setEnabled(True)
+                elif control in _PROMPT_TYPE_TO_BUTTON_INDEX:
+                    self.interaction_button.buttons[_PROMPT_TYPE_TO_BUTTON_INDEX[control]].setEnabled(True)
+
+        self.interaction_log = NullInteractionLog()
+        self.current_case_id = None
+        self.preset_selection.setCurrentIndex(-1)
+        self.preset_selection.setEnabled(True)
+        self.play_around_ckbx.setChecked(False)
+        self.play_around_ckbx.setEnabled(True)
+        self.preset_description_button.setEnabled(False)
+        self.change_preset_button.setEnabled(False)
+
         self.config_path = path
         with open(path, 'r') as f:
             config = json.load(f)
@@ -423,6 +500,7 @@ class nnInteractiveWidget(LayerControls):
         # Presets need config_dir/config_basename (see resolve_session()), which only
         # exist once config_path is set.
         self.browse_presets_button.setEnabled(True)
+        self.play_around_ckbx.setEnabled(True)
 
     def on_prev_case(self):
         self._step_case(-1)
@@ -450,12 +528,25 @@ class nnInteractiveWidget(LayerControls):
         # already declared before Open Case became reachable, so this is always set here.
         _outgoing_case_id = getattr(self, "current_case_id", None)
         if _outgoing_case_id is not None:
+            # If Next Object already spent this object_index on a different object,
+            # this one needs a fresh id — otherwise it'd silently collide with that
+            # earlier record (same case_obj id, only distinguishable by timestamp).
+            if self._object_index_logged:
+                self.object_index += 1
             self.interaction_log.finalize_case(f"{_outgoing_case_id}_obj{self.object_index}")
+            self._object_index_logged = True
 
         case_id = self.case_selection.currentText()
         if case_id == "":
             return
         self.current_case_id = case_id
+
+        # Sweep whatever the outgoing case left behind — stray interaction (point/bbox/
+        # scribble/lasso) layers, and every finished-object layer on_next() ever created
+        # this session — neither was cleared by anything else on a case switch. See
+        # nninteractive-implementation-handoff.md.
+        self._clear_layers()
+        self._clear_finished_object_layers()
 
         case = self.full_image_cache[case_id]
         images = case['images']
@@ -473,10 +564,20 @@ class nnInteractiveWidget(LayerControls):
             self._viewer.layers.remove(old_layer_name)
 
         # Reuse an already-open layer for this exact file instead of opening a duplicate.
+        # Restricted to Image layers — the Labels layer add_label_layer() creates below
+        # deliberately copies the image's own source onto itself
+        # (label_layer._source = self.session_cfg["source"], in widget_controls.py), so
+        # an unfiltered search here wrongly matches the label layer instead of the real
+        # image on a same-case reopen: the old image layer gets removed above, the label
+        # layer's copied source.path makes this method think the image is "already
+        # open" and returns the label layer's name instead of reopening the real image
+        # — the image never reappears, and the "No Image Layer selected" check right at
+        # the top of on_init() (widget_controls.py:219-220) then crashes.
         existing = next(
             (
                 layer for layer in self._viewer.layers
-                if os.path.abspath(layer.source.path or "") == os.path.abspath(path)
+                if isinstance(layer, Image)
+                and os.path.abspath(layer.source.path or "") == os.path.abspath(path)
             ),
             None,
         )

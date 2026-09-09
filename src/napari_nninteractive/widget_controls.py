@@ -59,6 +59,17 @@ class LayerControls(BaseGUI):
         self.colormap = ColorMapper(49, seed=0.5, background_value=0)
         self._scribble_brush_size = 5
         self.object_index = 0
+        # True once the current object_index value has already been used in a
+        # finalize_case() call (by on_next()) — a later leave-the-case finalize (Open
+        # Case / Change Preset) must bump object_index first when this is True, or it
+        # would silently reuse that same id for a different object. Reset in on_init().
+        self._object_index_logged = False
+        # Names on_next() hands out to finished-object layers (see on_next() below) —
+        # nothing else ever removed these, so they accumulated across every case/preset
+        # for the rest of the session. Tracked here so a case/preset switch can sweep
+        # them; _clear_layers() itself can't do this since on_next() also calls it right
+        # after creating the very layer this list is meant to protect.
+        self._finished_object_layer_names = []
 
         self._viewer.layers.selection.events.active.connect(self.on_layer_selected)
 
@@ -69,6 +80,16 @@ class LayerControls(BaseGUI):
         for layer_name in layer_names:
             if layer_name in self._viewer.layers:
                 self._viewer.layers.remove(layer_name)
+
+    def _clear_finished_object_layers(self) -> None:
+        """Removes every finished-object layer on_next() has created (the renamed
+        `"object N - ..."` layers, or the aggregated `"semantic map - ..."` layer) —
+        call on a case/preset switch, once none of them are still relevant. Not called
+        from on_next() itself, which needs the layer it just created to survive."""
+        for layer_name in self._finished_object_layer_names:
+            if layer_name in self._viewer.layers:
+                self._viewer.layers.remove(layer_name)
+        self._finished_object_layer_names = []
 
     def add_point_layer(self) -> None:
         """Adds a single point layer to the viewer."""
@@ -372,6 +393,7 @@ class LayerControls(BaseGUI):
 
         # Add Layer
         self.object_index = 0
+        self._object_index_logged = False
         if self.label_layer_name in self._viewer.layers:
             self._viewer.layers.remove(self.label_layer_name)
         self.add_label_layer(self._data_result, self.label_layer_name)
@@ -406,11 +428,13 @@ class LayerControls(BaseGUI):
             _name = f"object {self.object_index+1} - {self.session_cfg['name']}"
             self.add_label_layer(label_layer.data.copy(), _name)
             self._viewer.layers[_name].colormap = self.colormap[self.object_index]
+            self._finished_object_layer_names.append(_name)
 
         else:
             _sem_name = f"semantic map - {self.session_cfg['name']}"
             if _sem_name not in self._viewer.layers:
                 self.add_label_layer(np.zeros_like(label_layer.data), _sem_name)
+                self._finished_object_layer_names.append(_sem_name)
 
             sem_layer = self._viewer.layers[_sem_name]
 

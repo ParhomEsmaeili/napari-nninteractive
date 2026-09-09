@@ -98,8 +98,6 @@ class BaseGUI(QWidget):
 
     def _unlock_session(self):
         """Unlocks the session, enabling model and image selection, and initializing controls."""
-        self.init_button.setEnabled(True)
-
         self.resume_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.instance_aggregation_ckbx.setEnabled(False)
@@ -125,15 +123,15 @@ class BaseGUI(QWidget):
         # before switching — true once a case is actually loaded, but not at true bootstrap
         # (nothing loaded yet, or a prior session just got invalidated by re-browsing
         # config). Override back to the correct bootstrap values: nothing to complete/
-        # abandon, but case selection must stay reachable to load the first case at all.
-        self._set_case_controls_enabled(True)
+        # abandon yet, and case selection stays locked until a preset is chosen — picking a
+        # case before a preset is active would leave that case's prompts untimed and
+        # undiscarded once the preset does lock in. on_preset_selected() is what opens it up.
+        self._set_case_controls_enabled(False)
         self.complete_button.setEnabled(False)
         self.abandon_button.setEnabled(False)
 
     def _lock_session(self):
         """Locks the session, disabling model and image selection, and enabling control buttons."""
-        self.init_button.setEnabled(False)
-
         self.reset_button.setEnabled(True)
         self.instance_aggregation_ckbx.setEnabled(True)
         self.prompt_button.setEnabled(True)
@@ -162,29 +160,46 @@ class BaseGUI(QWidget):
 
     def _gate_idle(self):
         """Fresh — no window open, no outcome declared yet for the current object/case.
-        Can Resume (start a window) or declare Complete/Abandon directly (e.g. skipping a
-        case with zero interactions still needs an explicit outcome). Can't move on yet —
-        Next Object/case switching require an outcome first.
+        Can Resume (start a window). Abandon is reachable directly too — skipping a case
+        with zero interactions is a real, diagnosable outcome. Complete is not reachable
+        until at least one Resume->Run window has actually completed (see
+        InteractionLog.has_recorded_window) — an empty "completed" object doesn't mean
+        anything, unlike an empty abandon. Can't move on yet either way — Next
+        Object/case switching require an outcome first.
 
-        No-op (beyond disabling the timing controls themselves) when no preset is
-        selected — run_button/prompt-tools/reset_button/case_selection stay exactly as
-        _lock_session()/_unlock_session() already set them, today's exact behavior."""
-        if isinstance(self.interaction_log, NullInteractionLog):
-            self.resume_button.setEnabled(False)
-            self.complete_button.setEnabled(False)
-            self.abandon_button.setEnabled(False)
-            return
-        self.resume_button.setEnabled(True)
+        With no preset selected (NullInteractionLog), everything below still locks down
+        the same way — the only difference is Resume/Complete/Abandon themselves also
+        stay disabled, since there's no timing window to open or outcome to declare
+        against. Nothing that unlocks the prompt tools should be reachable without an
+        active preset (matches the Case Selection hard-gate — see
+        nninteractive-implementation-handoff.md); this used to be a no-op here, which let
+        Open Case (which auto-chains into on_init(), same as CLoPA's Load Image) unlock
+        the prompt tools with no preset active.
+
+        Browse Config is also gated here (see nninteractive-implementation-handoff.md's
+        "Re-browsing Config" fix): safe to browse a new config exactly when there's no
+        live, undeclared object in progress — no preset active, or no case ever opened
+        yet (current_case_id is None). Not safe once a case is open with no outcome
+        declared — that's the unsafe half of idle, same reasoning _gate_window_open()
+        and _gate_case_done() apply unconditionally below."""
         self.run_button.setEnabled(False)
         self.interaction_button.setEnabled(False)
         self.prompt_button.setEnabled(False)
         self.add_button.setEnabled(False)
         self.add_ckbx.setEnabled(False)
-        self.complete_button.setEnabled(True)
-        self.abandon_button.setEnabled(True)
         self.reset_button.setEnabled(False)
         self._set_case_controls_enabled(False)
         self._set_active_prompt_layer_mode(_NEUTRAL_MODE)
+        if isinstance(self.interaction_log, NullInteractionLog):
+            self.resume_button.setEnabled(False)
+            self.complete_button.setEnabled(False)
+            self.abandon_button.setEnabled(False)
+            self.browse_config_button.setEnabled(True)
+            return
+        self.resume_button.setEnabled(True)
+        self.complete_button.setEnabled(self.interaction_log.has_recorded_window)
+        self.abandon_button.setEnabled(True)
+        self.browse_config_button.setEnabled(getattr(self, 'current_case_id', None) is None)
 
     def _gate_window_open(self):
         """Timing window open (Resume clicked, not yet closed via Run). Only Run and the
@@ -199,6 +214,7 @@ class BaseGUI(QWidget):
         self.abandon_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self._set_case_controls_enabled(False)
+        self.browse_config_button.setEnabled(False)
         self._set_active_prompt_layer_mode(
             _ADD_MODE_BY_INTERACTION_INDEX.get(self.interaction_button.index)
         )
@@ -216,18 +232,35 @@ class BaseGUI(QWidget):
         self.complete_button.setEnabled(False)
         self.abandon_button.setEnabled(False)
         self.reset_button.setEnabled(True)
+        self.browse_config_button.setEnabled(True)
         self._set_case_controls_enabled(True)
         self._set_active_prompt_layer_mode(_NEUTRAL_MODE)
 
     def _set_active_prompt_layer_mode(self, mode):
         """Sets the currently-selected prompt layer's own napari mode — separate from
         (and untouched by) any of the Qt buttons above. mode=None is a no-op, so an
-        unrecognized interaction index safely does nothing rather than raising."""
+        unrecognized interaction index safely does nothing rather than raising.
+
+        layer_dict doesn't exist yet the moment _gate_idle() now runs unconditionally
+        during true bootstrap (BaseGUI.__init__ calls _unlock_session() before the
+        LayerControls subclass's __init__ has set it up) — nothing to set a mode on
+        yet either way, so no-op rather than raising."""
         if mode is None:
             return
-        layer_name = self.layer_dict.get(self.interaction_button.index)
+        layer_dict = getattr(self, 'layer_dict', None)
+        if layer_dict is None:
+            return
+        layer_name = layer_dict.get(self.interaction_button.index)
         if layer_name is not None and layer_name in self._viewer.layers:
-            self._viewer.layers[layer_name].mode = mode
+            layer = self._viewer.layers[layer_name]
+            layer.mode = mode
+            # Setting .mode alone doesn't make this layer clickable: napari only routes
+            # canvas clicks to whichever layer is the active/selected one, and that
+            # selection is stolen by every layer add_label_layer() adds (Open Case's
+            # fresh working layer, on_next()'s finished-object layer) — reclaim it here
+            # so Resume reliably makes the right layer clickable without a manual
+            # reselect in the layers panel.
+            self._viewer.layers.selection.active = layer
 
     def _clear_layers(self):
         """Abstract function to clear all needed layers"""
@@ -273,7 +306,9 @@ class BaseGUI(QWidget):
         _layout.addLayout(_boxlayout)
         self.config_path_display = setup_lineedit(_boxlayout, placeholder="No config loaded...")
         self.config_path_display.setReadOnly(True)
-        setup_iconbutton(_boxlayout, "", "path", self._viewer.theme, function=self.on_browse_config)
+        self.browse_config_button = setup_iconbutton(
+            _boxlayout, "", "path", self._viewer.theme, function=self.on_browse_config
+        )
 
         _group_box.setLayout(_layout)
         return _group_box
@@ -301,6 +336,16 @@ class BaseGUI(QWidget):
         )
         _layout.addLayout(_path_layout)
 
+        self.play_around_ckbx = setup_checkbox(
+            _layout,
+            "Play-around (exclude from timing)",
+            False,
+            tooltips="Familiarization session, not real timing data — writes to a "
+            "separate _play_around.jsonl instead of the normal file, so timing "
+            "analysis excludes it by construction. Set before picking a preset — "
+            "locked once one's selected, same as the preset dropdown itself.",
+        )
+
         _preset_row = QHBoxLayout()
         self.preset_selection = setup_combobox(
             _preset_row, options=[], placeholder="No preset selected", function=self.on_preset_selected, stretch=3
@@ -324,6 +369,7 @@ class BaseGUI(QWidget):
         self.preset_selection.setEnabled(False)
         self.preset_description_button.setEnabled(False)
         self.change_preset_button.setEnabled(False)
+        self.play_around_ckbx.setEnabled(False)
 
         _group_box.setLayout(_layout)
         return _group_box
@@ -370,14 +416,13 @@ class BaseGUI(QWidget):
         """Initializes the control buttons (Initialize and Reset)."""
         _group_box, _layout = setup_vgroupbox(text="")
 
-        self.init_button = setup_iconbutton(
-            _layout,
-            "Initialize",
-            "new_labels",
-            self._viewer.theme,
-            self.on_init,
-            tooltips="Initialize the Model and Image Pair",
-        )
+        # No standalone Initialize button — Open Case is the only path in (auto-chains
+        # into on_init(), same as CLoPA's Load Image). A manually-triggered Initialize
+        # was only ever reachable at true bootstrap anyway (_lock_session() disables it
+        # for the rest of the session the moment any real case is opened), and its only
+        # distinct behavior — initializing on an arbitrary dropped-in image outside the
+        # case catalog — is a backdoor around the same controlled-catalog design every
+        # other gate in this plugin enforces. See nninteractive-implementation-handoff.md.
 
         self.reset_interaction_button = setup_iconbutton(
             _layout,
