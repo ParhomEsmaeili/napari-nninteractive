@@ -81,6 +81,15 @@ class nnInteractiveWidget(LayerControls):
         self.interaction_log.set_outcome("abandoned")
         self._gate_case_done()
 
+    def _finalize_current_object(self, case_id: str):
+        """Every finalize_case() call site should go through here, not call it directly
+        — stamps whatever's currently in the notes field (optional; '' if left blank)
+        into the record, then clears the field so it doesn't leak into the next
+        object/case."""
+        self.interaction_log.set_notes(self.notes_lineedit.text())
+        self.interaction_log.finalize_case(case_id)
+        self.notes_lineedit.clear()
+
     def on_browse_presets(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select presets.json", PRESETS_DEFAULT_DIR, "JSON files (*.json)"
@@ -189,10 +198,11 @@ class nnInteractiveWidget(LayerControls):
         if self.interaction_log.has_outcome:
             if self._object_index_logged:
                 self.object_index += 1
-            self.interaction_log.finalize_case(f"{self.current_case_id}_obj{self.object_index}")
+            self._finalize_current_object(f"{self.current_case_id}_obj{self.object_index}")
             self._object_index_logged = True
         else:
             self.interaction_log.discard_object()
+            self.notes_lineedit.clear()
 
         # Same sweep as on_open_case() — a preset switch abandons whatever case was open
         # just as much as switching cases does.
@@ -346,6 +356,7 @@ class nnInteractiveWidget(LayerControls):
         # Hard reset for this object — deliberately ungated (unlike everything else), so
         # a mistaken Complete/Abandon can always be walked back. Closes any open window too.
         self.interaction_log.discard_object()
+        self.notes_lineedit.clear()
         self._gate_idle()
 
     def on_reset_pending_interactions(self):
@@ -394,7 +405,7 @@ class nnInteractiveWidget(LayerControls):
         # guarantees Next Object is unreachable until one of those ran, so it's always set here.
         # object_index suffix disambiguates multiple objects within the same case — super()
         # already incremented it above, so this is "the object number just committed".
-        self.interaction_log.finalize_case(f"{self.case_selection.currentText()}_obj{self.object_index}")
+        self._finalize_current_object(f"{self.case_selection.currentText()}_obj{self.object_index}")
         # Marks this object_index value as spent — if the user leaves without another
         # Next Object, on_open_case()/on_change_preset() must bump past it rather than
         # reusing it for a different object (see _object_index_logged's own docstring).
@@ -461,7 +472,7 @@ class nnInteractiveWidget(LayerControls):
         # ever opened at all — so this can never write a None-outcome record.
         _outgoing_case_id = getattr(self, "current_case_id", None)
         if _outgoing_case_id is not None:
-            self.interaction_log.finalize_case(f"{_outgoing_case_id}_obj{self.object_index}")
+            self._finalize_current_object(f"{_outgoing_case_id}_obj{self.object_index}")
 
         # Full reset — browsing a new config invalidates everything tied to the old
         # one: the preset (locked_controls/save_path are specific to the old config's
@@ -533,7 +544,7 @@ class nnInteractiveWidget(LayerControls):
             # earlier record (same case_obj id, only distinguishable by timestamp).
             if self._object_index_logged:
                 self.object_index += 1
-            self.interaction_log.finalize_case(f"{_outgoing_case_id}_obj{self.object_index}")
+            self._finalize_current_object(f"{_outgoing_case_id}_obj{self.object_index}")
             self._object_index_logged = True
 
         case_id = self.case_selection.currentText()

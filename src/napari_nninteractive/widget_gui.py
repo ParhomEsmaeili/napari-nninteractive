@@ -460,6 +460,12 @@ class BaseGUI(QWidget):
             "Otherwise: Create a separate layer for each object. ",
         )
 
+        # Optional per-case notes — read from this field at finalize time (see
+        # _finalize_current_object()), then cleared; never required to Complete/Abandon.
+        self.notes_lineedit = setup_lineedit(
+            _layout, placeholder="Notes for this case/object (optional)",
+        )
+
         # Timing/logging controls — explicit actions, not a passive toggle, so an outcome
         # can never be silently left stale from a previous case. Pressing either sets
         # InteractionLog's outcome and locks everything except Next Object/Case selector,
