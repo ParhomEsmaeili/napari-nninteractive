@@ -323,8 +323,19 @@ class nnInteractiveWidget(LayerControls):
 
     def on_model_selected(self):
         """Reset the current session completely"""
-        super().on_model_selected()
+        super().on_model_selected()  # _clear_layers() + _unlock_session()
         self.session = None
+        # _unlock_session() above unconditionally re-locks Case Selection (bootstrap
+        # default: no preset active yet) — wrong here whenever a preset already is
+        # active, e.g. clearing the local-checkpoint field to switch to the HF-download
+        # path mid-session. The case list comes entirely from the loaded config
+        # (full_image_cache), structurally independent of which model/checkpoint is
+        # selected, so switching checkpoints has no reason to touch it at all. Same
+        # bootstrap-gap pattern as on_preset_selected()'s own override, mirrored here.
+        if not isinstance(self.interaction_log, NullInteractionLog):
+            self._set_case_controls_enabled(True)
+            self.complete_button.setEnabled(False)
+            self.abandon_button.setEnabled(False)
 
     def on_image_selected(self):
         """Deliberately does nothing. This fires on every change of which layer the
