@@ -366,8 +366,32 @@ class nnInteractiveWidget(LayerControls):
         # commit point rather than forcing has_positive_bbox False — see
         # [[concept/nninteractive-reset-pending]] for the desync edge case that guards
         # against (a committed positive bbox predicted at zoom 1 without refinement).
+        #
+        # The visual layers get the same commit-point restore, not a wipe: on_run() never
+        # clears them (committed prompts stay visible across Run cycles, by the base
+        # plugin's own design — see _snapshot_committed_interactions()'s docstring), so
+        # wiping them here would remove already-committed prompts Reset Pending was never
+        # supposed to touch. Trimmed via each layer's own remove_last() (not a raw `.data`
+        # reassignment — see _snapshot_committed_interactions()'s docstring for why). A
+        # layer with no snapshot entry didn't exist at commit time — removed entirely, same
+        # as the old unconditional _clear_layers() would have done for it. Scribble is
+        # excluded from counting (see _snapshot_committed_interactions()) and still gets the
+        # old wipe-the-whole-layer treatment.
         _ind = self.interaction_button.index
-        self._clear_layers()
+        _committed_layer_counts = getattr(self, "_committed_layer_counts", {})
+        for layer_name in self.layer_dict.values():
+            if layer_name not in self._viewer.layers:
+                continue
+            if layer_name == self.scribble_layer_name:
+                self._viewer.layers.remove(layer_name)
+                continue
+            target_count = _committed_layer_counts.get(layer_name)
+            if target_count is None:
+                self._viewer.layers.remove(layer_name)
+                continue
+            layer = self._viewer.layers[layer_name]
+            while len(layer.data) > target_count:
+                layer.remove_last()
         if self.session is not None and getattr(self, "_committed_interactions", None) is not None:
             self.session.interactions = self._committed_interactions.clone()
             self.session.has_positive_bbox = self._committed_has_positive_bbox
@@ -379,7 +403,15 @@ class nnInteractiveWidget(LayerControls):
         # discard_pending()'s docstring — so this also needs a fresh Resume, same as
         # on_reset_interactions().
         self.interaction_log.discard_pending()
-        self._gate_idle()
+        # Reset Pending is deliberately reachable in every gate state (no gate method
+        # touches reset_pending_button — see nninteractive-implementation-handoff.md's
+        # Revisit checklist). But case_done means an outcome was already declared and is
+        # waiting on Next Object/Open Case — unconditionally re-gating to idle here would
+        # wrongly re-enable Resume/Complete/Abandon and let the same object be reopened
+        # after it's already been marked done. No-op the gate in that state; idle/
+        # window_open are the only states this should actually reset to idle from.
+        if not self.interaction_log.has_outcome:
+            self._gate_idle()
 
     def on_next(self):
         """Reset the Interactions of current session"""
@@ -426,13 +458,33 @@ class nnInteractiveWidget(LayerControls):
         None right after it returns. _finish_preprocessing_and_initialize_interactions()
         is the same wait every add_X_interaction() call does internally before touching
         the tensor; calling it here is a no-op once the tensor already exists (every
-        other call site), so this is cheap everywhere except right after set_image()."""
+        other call site), so this is cheap everywhere except right after set_image().
+
+        Also snapshots each point/bbox/lasso layer's item *count* at this same commit point
+        (`_committed_layer_counts`) — Reset Pending trims back down to that count via the
+        layer's own `remove_last()` (not a raw `.data` reassignment, which would desync each
+        layer's parallel color/metadata bookkeeping — e.g. SinglePointLayer.point_colors —
+        from the actual point count). This keeps already-committed prompts visible (matching
+        on_run()'s own behavior of never touching the layers) while only pending ones vanish.
+        A layer not present at commit time (not in this dict) means Reset Pending should
+        remove it entirely — it didn't exist before the pending prompts created it.
+
+        Deliberately excludes the scribble layer: ScribbleLayer.remove_last() is a Labels-
+        layer undo() off its own history stack, not a count of discrete items — a commit-
+        point item count doesn't apply to it the same way, so it's left to the old
+        clear-the-whole-layer behavior (see on_reset_pending_interactions()) rather than risk
+        a wrong partial-undo."""
         if self.session is None:
             return
         self.session._finish_preprocessing_and_initialize_interactions()
         if self.session.interactions is not None:
             self._committed_interactions = self.session.interactions.clone()
             self._committed_has_positive_bbox = self.session.has_positive_bbox
+        self._committed_layer_counts = {
+            layer_name: len(self._viewer.layers[layer_name].data)
+            for layer_name in self.layer_dict.values()
+            if layer_name in self._viewer.layers and layer_name != self.scribble_layer_name
+        }
 
     def on_propagate_ckbx(self, *args, **kwargs):
         if self.session is not None:
