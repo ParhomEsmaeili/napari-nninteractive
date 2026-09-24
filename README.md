@@ -107,6 +107,32 @@ c) Run this to start napari with the plugin and open an image directly
 napari demo_data/liver_145_0000.nii.gz -w napari-nninteractive
 ```
 
+### Launching this fork's timing build
+
+This fork adds the Prompt Placement Timing build (Resume / Complete / Abandon
+gating, preset dropdown, per-case notes) on the `feature/timing-instrumentation`
+branch. `launch_timing.sh` at the repo root starts it:
+
+```bash
+bash launch_timing.sh
+```
+
+It activates the `napari-nninteractive-fork-dev` conda env, re-points that env's
+editable install at this checkout (`pip install --no-deps -e .`), then runs
+`napari -w napari-nninteractive`.
+
+Things to know:
+
+- **It does not switch branches.** It runs whatever is checked out in this
+  working directory, so check out `feature/timing-instrumentation` first.
+- **Machine-specific.** The script hardcodes the path to `conda.sh` and expects
+  the `napari-nninteractive-fork-dev` env to already exist.
+- **Timing build dependency.** It imports `presets` and `interaction_log` from the
+  separate `front-end-timing` package, which must be installed in the same env.
+- **Model weights.** If a `checkpoints/nnInteractive_v1.0` folder exists in this
+  checkout, the Model Selection field defaults to it. Clear that field to
+  download the weights from HuggingFace instead.
+
 # How to use
 
 **Note:** To open Nifti (.nii.gz, .nii) files we recommend to select napari-nifti.
