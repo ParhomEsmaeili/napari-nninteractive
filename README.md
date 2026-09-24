@@ -133,6 +133,25 @@ Things to know:
   checkout, the Model Selection field defaults to it. Clear that field to
   download the weights from HuggingFace instead.
 
+#### Where the timing logs are written
+
+The timing build writes its records next to the config you load, not into this
+repo. For a config at `<output>/<dataset>/<experiment>/config.json` (the layout
+`export_napari_config.py --output <output>` produces), records go to
+`<output>/<dataset>/timing/<experiment>/<fe_experiment>/`: a `<model>_NN.jsonl`
+per preset (plus `_play_around` variants) and a `_conditions.json` manifest.
+
+Nothing in the code stops that path landing inside a git checkout, so keep it out:
+
+- Give `export_napari_config.py --output` a directory **outside** every repo
+  checkout (this fork, napari-clopa, `front-end-timing`, CLoPA). Pointing it
+  inside one puts both the config and the logs in that repo's working tree.
+- If you do end up inside a repo, add the export folder and `timing/` to that
+  repo's `.gitignore`, and run `git status` before committing to check that no
+  `.jsonl` slipped in.
+- The flip side: a directory outside git has no history and no backup. Copy the
+  timing folders somewhere safe once real data is being collected.
+
 # How to use
 
 **Note:** To open Nifti (.nii.gz, .nii) files we recommend to select napari-nifti.
