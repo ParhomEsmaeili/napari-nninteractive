@@ -133,6 +133,19 @@ Things to know:
   checkout, the Model Selection field defaults to it. Clear that field to
   download the weights from HuggingFace instead.
 
+#### Ending a session
+
+Use **Finish & Close** (next to Complete / Abandon) rather than just closing the
+window. Records are only written when you leave an object (Next Object, Open Case,
+Change Preset), so it saves the current object's record and then closes the app.
+
+- Click **Complete** or **Abandon** first if you've done any work on the object.
+  With work but no outcome, the button refuses and tells you so; it never writes
+  an outcome-less record.
+- On a fresh object with nothing done, it just closes.
+- If you close the window another way (X, Ctrl+Q) after Complete/Abandon, a
+  safety net on app exit writes the pending record too.
+
 #### Where the timing logs are written
 
 The timing build writes its records next to the config you load, not into this

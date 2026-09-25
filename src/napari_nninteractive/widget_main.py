@@ -13,7 +13,7 @@ from napari.layers import Image
 from napari.utils.notifications import show_warning
 from napari.viewer import Viewer
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-from qtpy.QtWidgets import QFileDialog, QMessageBox, QWidget
+from qtpy.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
 
 from napari_nninteractive.widget_controls import LayerControls
 import presets
@@ -65,6 +65,9 @@ class nnInteractiveWidget(LayerControls):
         super().__init__(viewer, parent)
         self.session = None
         self._viewer.dims.events.order.connect(self.on_axis_change)
+        # Safety net for closing the window (X button / Ctrl+Q) without Finish & Close —
+        # see _on_app_quit().
+        QApplication.instance().aboutToQuit.connect(self._on_app_quit)
         # self.interaction_log defaults to NullInteractionLog — see BaseGUI.__init__.
         # Replaced with a real InteractionLog once a preset is selected (on_preset_selected()).
 
@@ -89,6 +92,37 @@ class nnInteractiveWidget(LayerControls):
         self.interaction_log.set_notes(self.notes_lineedit.text())
         self.interaction_log.finalize_case(case_id)
         self.notes_lineedit.clear()
+
+    def _flush_declared_outcome(self):
+        """Writes the current object's record if an outcome was declared but not yet
+        flushed (same id logic as leaving via Open Case). No-op otherwise, so calling it
+        twice — e.g. Finish & Close, then the aboutToQuit safety net — writes once."""
+        if getattr(self, "current_case_id", None) is None or not self.interaction_log.has_outcome:
+            return
+        if self._object_index_logged:
+            self.object_index += 1
+        self._finalize_current_object(f"{self.current_case_id}_obj{self.object_index}")
+        self._object_index_logged = True
+
+    def _on_app_quit(self):
+        try:
+            self._flush_declared_outcome()
+        except Exception as e:
+            warnings.warn(f"Could not write the pending timing record on exit: {e}")
+
+    def on_finish_and_close(self):
+        """Ends the session cleanly: flushes the declared outcome, then closes the viewer
+        and quits. Refuses if the object has work (a recorded or open window) but no
+        Complete/Abandon — the app never writes a null-outcome record."""
+        log = self.interaction_log
+        if not log.has_outcome and (log.has_recorded_window or log.has_open_window):
+            show_warning(
+                "Click Complete or Abandon first — this object has work with no outcome yet."
+            )
+            return
+        self._flush_declared_outcome()
+        self._viewer.close()
+        QApplication.instance().quit()
 
     def on_browse_presets(self):
         path, _ = QFileDialog.getOpenFileName(

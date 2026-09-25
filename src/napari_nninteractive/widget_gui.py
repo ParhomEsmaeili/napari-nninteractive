@@ -486,6 +486,18 @@ class BaseGUI(QWidget):
             self.on_abandon,
             tooltips="Mark this case/object as abandoned, then use Next Object or Open Case to move on",
         )
+        # Not touched by any gate method — always clickable, and on_finish_and_close()
+        # itself refuses when there's unfinished work. See its docstring.
+        self.finish_button = setup_iconbutton(
+            _layout,
+            "Finish & Close",
+            "lock",
+            self._viewer.theme,
+            self.on_finish_and_close,
+            tooltips="End the session: saves the current object's record (if you've already "
+            "clicked Complete or Abandon), then closes the window. Refuses if this object "
+            "has work but no Complete/Abandon yet.",
+        )
 
         _group_box.setLayout(_layout)
         return _group_box
