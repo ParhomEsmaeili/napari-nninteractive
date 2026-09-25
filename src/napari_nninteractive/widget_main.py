@@ -64,10 +64,14 @@ class nnInteractiveWidget(LayerControls):
         """
         super().__init__(viewer, parent)
         self.session = None
+        self._notes_cache = ""
+        self.notes_lineedit.textChanged.connect(lambda t: setattr(self, "_notes_cache", t))
         self._viewer.dims.events.order.connect(self.on_axis_change)
         # Safety net for closing the window (X button / Ctrl+Q) without Finish & Close —
         # see _on_app_quit().
-        QApplication.instance().aboutToQuit.connect(self._on_app_quit)
+        # A lambda, not the bound method: Qt drops bound-method connections once the widget
+        # is destroyed, which happens before aboutToQuit fires when the X button is used.
+        QApplication.instance().aboutToQuit.connect(lambda: self._on_app_quit())
         # self.interaction_log defaults to NullInteractionLog — see BaseGUI.__init__.
         # Replaced with a real InteractionLog once a preset is selected (on_preset_selected()).
 
@@ -89,9 +93,16 @@ class nnInteractiveWidget(LayerControls):
         — stamps whatever's currently in the notes field (optional; '' if left blank)
         into the record, then clears the field so it doesn't leak into the next
         object/case."""
-        self.interaction_log.set_notes(self.notes_lineedit.text())
+        try:
+            notes = self.notes_lineedit.text()
+        except RuntimeError:  # widget already destroyed (window closed) — use the cached text
+            notes = self._notes_cache
+        self.interaction_log.set_notes(notes)
         self.interaction_log.finalize_case(case_id)
-        self.notes_lineedit.clear()
+        try:
+            self.notes_lineedit.clear()
+        except RuntimeError:
+            pass
 
     def _flush_declared_outcome(self):
         """Writes the current object's record if an outcome was declared but not yet
