@@ -151,6 +151,13 @@ Nothing in the code stops that path landing inside a git checkout, so keep it ou
   `.jsonl` slipped in.
 - The flip side: a directory outside git has no history and no backup. Copy the
   timing folders somewhere safe once real data is being collected.
+- **Cleaning up a dataset's exports can delete its logs.** The logs sit in that
+  dataset's own folder, at `<output>/<dataset>/timing/<experiment>/`, beside the
+  experiment's config folder rather than inside it. Deleting only the config
+  folder leaves them, but deleting `<dataset>/timing/`, one `timing/<experiment>/`
+  or the whole `<dataset>/` folder removes them. So before clearing out or
+  regenerating a dataset's exports (for example after correcting its data), copy
+  its `timing/` folder somewhere safe. Other datasets' logs are unaffected.
 
 # How to use
 
