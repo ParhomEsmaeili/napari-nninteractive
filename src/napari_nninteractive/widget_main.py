@@ -635,6 +635,24 @@ class nnInteractiveWidget(LayerControls):
         self.case_selection.setCurrentIndex(_new_idx)  # currentText() reflects this immediately
         self.on_open_case()
 
+    def _format_targets(self) -> list:
+        """semantic_id_dict's keys, each annotated with which original dataset.json labels
+        it absorbed — e.g. 'tumour_core (includes: enhancing tumour, non-enhancing tumor)',
+        or 'background (includes: background, edema)' when something got folded into
+        background rather than ignored. Always annotated, even for a 1:1 key with no real
+        merge (e.g. 'mass (includes: mass)') — consistent format beats a plain entry sitting
+        next to annotated ones. On a config exported before this field existed,
+        semantic_class_mapping is absent entirely — falls back to 'key (includes: key)' for
+        every entry, same consistent shape."""
+        semantic_class_mapping = self.dataset_level_schema['segmentation_task_schema'].get(
+            'semantic_class_mapping', {}
+        )
+        entries = []
+        for key in self.semantic_id_dict:
+            originals = semantic_class_mapping.get(key, [key])
+            entries.append(f"{key} (includes: {', '.join(originals)})")
+        return entries
+
     def on_open_case(self):
         """Convenience layer on top of the existing flow — opens the resolved image path(s)
         into napari and pre-selects it in Image Selection. No hard-refuse gate, deliberately
@@ -716,7 +734,7 @@ class nnInteractiveWidget(LayerControls):
             self.image_selection.setCurrentIndex(idx)
         self.current_case_layer_name = layer_name
         self.task_label.setText(
-            f"Target: {list(self.semantic_id_dict.keys())} | Channels: {case.get('task_channels', 'unknown')}"
+            f"Target: {self._format_targets()} | Channels: {case.get('task_channels', 'unknown')}"
         )
 
         # Auto-chain into Initialize — after Open Case there's only one sensible next
