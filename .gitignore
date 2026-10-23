@@ -86,3 +86,4 @@ venv/
 
 # written by setuptools_scm
 **/_version.py
+.agent-routing.local.yml

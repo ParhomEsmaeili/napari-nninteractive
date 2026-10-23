@@ -1,0 +1,7 @@
+# agent-routing — maps a terminal phrase to classification tags (appendable).
+# Copy to .agent-routing.local.yml (gitignored) and set your own phrases.
+triggers:
+  - phrase: ""            # e.g. "bug report"
+    tags: { type: bug, source: napari-nninteractive-fork }
+  - phrase: ""            # e.g. "transfer"
+    tags: { type: note, source: napari-nninteractive-fork }
