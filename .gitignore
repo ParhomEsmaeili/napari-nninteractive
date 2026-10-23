@@ -87,5 +87,5 @@ venv/
 **/_version.py
 
 
-CLAUDE.md
 AGENTS.md
+.agent-routing.local.yml
