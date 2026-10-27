@@ -2,6 +2,8 @@
 # Copy to .agent-routing.local.yml (gitignored) and set your own phrases.
 triggers:
   - phrase: ""            # e.g. "bug report"
-    tags: { type: bug, source: napari-nninteractive-fork }
+    tags: { type: bug, source: napari-nninteractive-fork, component: timing }   # component: wrapper | timing
+  - phrase: ""            # e.g. "wrapper bug"
+    tags: { type: bug, source: napari-nninteractive-fork, component: wrapper }
   - phrase: ""            # e.g. "transfer"
     tags: { type: note, source: napari-nninteractive-fork }
